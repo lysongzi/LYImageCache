@@ -133,7 +133,7 @@ typedef void(^LYSImageNoPramaBlock)();
 
 - (BOOL)diskImageCacheExistsForKey:(NSString *)key;
 
-- (BOOL)diskImageCacheExistsForKey:(NSString *)key withCompletion:(LYSImageNoPramaBlock)completion;
+- (void)diskImageCacheExistsForKey:(NSString *)key withCompletion:(LYImageCheckCacheCompletionBlock)completion;
 
 - (NSString *)cachePathForKey:(NSString *)key path:(NSString *)path;
 
