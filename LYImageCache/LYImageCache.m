@@ -11,6 +11,8 @@
 
 //默认缓存数据生存期为一周
 static const NSInteger defaultMaxCacheAge = 60 * 60 * 24 * 7;
+static unsigned char kPNGSignatureBytes[8] = {0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A};
+static NSData *kPNGSignatureData = nil;
 
 /**
  *  返回一张图片所占内存空间大小
@@ -24,7 +26,28 @@ FOUNDATION_STATIC_INLINE NSUInteger LYCacheCostForImage(UIImage *image)
     return image.size.height * image.size.width * image.scale * image.scale;
 }
 
-//定义一个NSCache子类，添加了监听内存警告通知，然后清除所有的缓存
+BOOL imageDataHasPNGPreffix(NSData *data){
+    
+    if (!kPNGSignatureData) {
+        kPNGSignatureData = [NSData dataWithBytes:kPNGSignatureBytes length:sizeof(kPNGSignatureBytes)/sizeof(char)];
+    }
+    
+    NSUInteger pngSignatureLength = [kPNGSignatureData length];
+    if ([data length] >= pngSignatureLength) {
+        //判断传入的data数据头部签名部分是否和PNG头部签名是否一致
+        if ([[data subdataWithRange:NSMakeRange(0, pngSignatureLength)] isEqualToData:kPNGSignatureData]) {
+            return YES;
+        }
+    }
+    
+    return NO;
+}
+
+#pragma mark - LYAutoReleaseCache
+
+/**
+ 定义一个NSCache子类，添加了监听内存警告通知，然后清除所有的缓存
+ */
 @interface LYAutoReleaseCache : NSCache
 @end
 
@@ -47,6 +70,11 @@ FOUNDATION_STATIC_INLINE NSUInteger LYCacheCostForImage(UIImage *image)
 
 @end
 
+#pragma mark - LYImageCache
+
+/**
+ *  LYImageCache
+ */
 @interface LYImageCache ()
 
 {
@@ -106,11 +134,11 @@ FOUNDATION_STATIC_INLINE NSUInteger LYCacheCostForImage(UIImage *image)
         
 #if TARGET_OS_IPHONE
         //当收到内存警告时清除内存中的缓存
-        [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(clearCaches) name:UIApplicationDidReceiveMemoryWarningNotification object:nil];
+        [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(clearAllCacheInDisk) name:UIApplicationDidReceiveMemoryWarningNotification object:nil];
         //当应用将关闭时，清除磁盘中过期的缓存
-        [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(clearDiskCache) name:UIApplicationWillTerminateNotification object:nil];
+        [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(clearDiskExpiredCache) name:UIApplicationWillTerminateNotification object:nil];
         //当应用进入后台时候，清除磁盘中过期的缓存,需要请求后台运行
-        [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(backgroundClearDiskCache) name:UIApplicationDidEnterBackgroundNotification object:nil];
+        [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(backgroundClearExpiredDiskCache) name:UIApplicationDidEnterBackgroundNotification object:nil];
 #endif
         
     }
@@ -125,6 +153,14 @@ FOUNDATION_STATIC_INLINE NSUInteger LYCacheCostForImage(UIImage *image)
 
 #pragma mark -
 
+- (void)setMaxMemoryCost:(NSUInteger)maxSize
+{
+    self.memoryCache.totalCostLimit = maxSize;
+}
+
+/**
+ *  获取沙盒中的cache目录
+ */
 - (NSString *)getPathForNamespace:(NSString *)ns
 {
     NSArray *directories = NSSearchPathForDirectoriesInDomains(NSCachesDirectory, NSUserDomainMask, YES);
@@ -174,6 +210,18 @@ FOUNDATION_STATIC_INLINE NSUInteger LYCacheCostForImage(UIImage *image)
     return [path stringByAppendingPathComponent:filename];
 }
 
+/**
+ *  返回对应key的缓存的路径
+ *
+ *  @param key 缓存的key
+ *
+ *  @return 缓存的默认文件路径
+ */
+- (NSString *)defaultCachePathForKey:(NSString *)key
+{
+    return [self cachePathForKey:key path:self.diskCachePath];
+}
+
 #pragma mark - 缓存存储/更新接口
 
 /**
@@ -185,7 +233,7 @@ FOUNDATION_STATIC_INLINE NSUInteger LYCacheCostForImage(UIImage *image)
  *  @param key     图片关键字
  *  @param toDisk  是否存储到磁盘中
  */
-- (void)setImage:(UIImage *)image refetchDateFromImage:(BOOL)refetch imageData:(NSData *)data forKey:(NSString *)key toDisk:(BOOL)toDisk
+- (void)setImage:(UIImage *)image refetchDateFromImage:(BOOL)refetch imageData:(NSData *)imageData forKey:(NSString *)key toDisk:(BOOL)toDisk
 {
     if (!image && !key) {
         return;
@@ -197,7 +245,44 @@ FOUNDATION_STATIC_INLINE NSUInteger LYCacheCostForImage(UIImage *image)
     }
     
     if (toDisk) {
-        //缓存到磁盘中
+        dispatch_async(self.ioQueue, ^{
+            NSData *data = imageData;
+            
+#if TARGET_OS_IPHONE
+            //需要先判断图片时PNG还是JPG格式，然后分别用不同方式提取响应的data数据
+            //PNG格式的图片前八个字节都是固定的：137 80 78 71 13 10 26 10
+            if (image && (refetch || !imageData)) {
+                int alphaInfo = CGImageGetAlphaInfo(image.CGImage);
+                BOOL imageIsPNG = !(alphaInfo == kCGImageAlphaNone ||
+                                    alphaInfo == kCGImageAlphaNoneSkipFirst ||
+                                    alphaInfo == kCGImageAlphaNoneSkipLast);
+                
+                //如果传进来了imageData，则直接提取相应数据
+                if ([imageData length] >= [kPNGSignatureData length]) {
+                    imageIsPNG = imageDataHasPNGPreffix(imageData);
+                }
+                
+                //根据不同类型图片提取图片数据
+                if (imageIsPNG) {
+                    data = UIImagePNGRepresentation(image);
+                }
+                else{
+                    data = UIImageJPEGRepresentation(image, (CGFloat)1.0);
+                }
+            }
+#endif
+            if (data) {
+                //如果缓存目录不存在，则创建该目录
+                if (![_fileManager fileExistsAtPath:_diskCachePath]) {
+                    [_fileManager createDirectoryAtPath:_diskCachePath withIntermediateDirectories:YES attributes:nil error:nil];
+                }
+                
+                //根据image key获取缓存路径
+                NSString *cachePathForKey = [self defaultCachePathForKey:key];
+                
+                [_fileManager createFileAtPath:cachePathForKey contents:data attributes:nil];
+            }
+        });
     }
 }
 
@@ -241,21 +326,144 @@ FOUNDATION_STATIC_INLINE NSUInteger LYCacheCostForImage(UIImage *image)
     return image;
 }
 
+/**
+ *  根据key在缓存目录下查找是否存在对应的缓存文件
+ *
+ *  @param key 缓存文件的key
+ *
+ *  @return 返回缓存的UIImage数据
+ */
 - (UIImage *)diskImageForKey:(NSString *)key
 {
-    //待实现
-    return nil;
+    UIImage *image = nil;
+    NSString *defaultCachePath = [self defaultCachePathForKey:key];
+    
+    NSData *data = [NSData dataWithContentsOfFile:defaultCachePath];
+    if (data) {
+        image =  [UIImage imageWithData:data];
+    }
+    
+    data = [NSData dataWithContentsOfFile:[defaultCachePath stringByDeletingPathExtension]];
+    if (data) {
+        image =  [UIImage imageWithData:data];
+    }
+    
+    if (image) {
+        //如果需要对图片进行其他处理
+        //但是暂时没有
+    }
+    
+    return image;
 }
 
 #pragma mark - 缓存移除接口
 
+- (void)removeImageForKey:(NSString *)key fromDisk:(BOOL)fromDisk withCompletion:(LYSImageNoPramaBlock)completion
+{
+    if (!key) {
+        return;
+    }
+    
+    //删除内存中的缓存
+    if (self.shouldCacheInMemory) {
+        [self.memoryCache removeObjectForKey:key];
+    }
+
+    if (fromDisk) {
+        dispatch_async(self.ioQueue, ^{
+            [_fileManager removeItemAtPath:[self defaultCachePathForKey:key] error:nil];
+            
+            if (completion) {
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    completion();
+                });
+            }
+        });
+    }
+    else if(completion){
+        //这里需要在主线程回调么?
+        dispatch_async(dispatch_get_main_queue(), ^{
+            completion();
+        });
+    }
+}
+
+- (void)removeImageForKey:(NSString *)key withCompletion:(LYSImageNoPramaBlock)completion
+{
+    [self removeImageForKey:key fromDisk:YES withCompletion:completion];
+}
+
+- (void)removeImageForKey:(NSString *)key fromDisk:(BOOL)fromDisk
+{
+    [self removeImageForKey:key fromDisk:fromDisk withCompletion:nil];
+}
+
+- (void)removeImageForKey:(NSString *)key
+{
+    [self removeImageForKey:key withCompletion:nil];
+}
+
+/**
+ *  清除所有内存缓冲
+ */
+- (void)clearMemory
+{
+    [self.memoryCache removeAllObjects];
+}
+
+/**
+ *  清除所有磁盘缓存
+ */
+- (void)clearDiskCache
+{
+    dispatch_async(self.ioQueue, ^{
+        //删除缓存目录,直接把所有缓存都删除了hahahahahhaha
+        [_fileManager removeItemAtPath:self.diskCachePath error:nil];
+        //创建新的缓存目录
+        [_fileManager createDirectoryAtPath:self.diskCachePath withIntermediateDirectories:YES attributes:nil error:nil];
+    });
+}
+
+/**
+ *  清除过期缓存
+ *
+ *  @param completion 清除完毕的回调
+ */
+- (void)clearDiskExpiredCacheWithCompletionBlock:(LYSImageNoPramaBlock)completion
+{
+    //待完成...
+}
+
+- (void)clearDiskExpiredCache
+{
+    [self clearDiskExpiredCacheWithCompletionBlock:nil];
+}
+
 /**
  *  在后台执行清除磁盘缓存中过期文件的操作
  */
-- (void)backgroundClearDiskCache
+- (void)backgroundClearExpiredDiskCache
 {
-    //待实现哈哈哈...
+    Class UIApplicationClass = NSClassFromString(@"UIApplication");
+    if (!UIApplicationClass || ![UIApplicationClass respondsToSelector:@selector(sharedApplication)]) {
+        return;
+    }
+    
+    UIApplication *application = [UIApplication sharedApplication];
+    //请求一个后台任务
+    __block UIBackgroundTaskIdentifier bgTask = [application beginBackgroundTaskWithExpirationHandler:^{
+        //如果后台任务过期/超时，则终止任务
+        [application endBackgroundTask:bgTask];
+        bgTask = UIBackgroundTaskInvalid;
+    }];
+    
+    //在后台执行一个耗时的清除过期缓存的任务
+    [self clearDiskExpiredCacheWithCompletionBlock:^{
+        [application endBackgroundTask:bgTask];
+        bgTask = UIBackgroundTaskInvalid;
+    }];
 }
+
 
 #pragma mark - 缓存查询接口
 
@@ -288,5 +496,7 @@ FOUNDATION_STATIC_INLINE NSUInteger LYCacheCostForImage(UIImage *image)
         });
     }
 }
+
+
 
 @end

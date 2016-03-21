@@ -91,6 +91,13 @@ typedef void(^LYSImageNoPramaBlock)();
  */
 - (instancetype)initWithNamespace:(NSString *)ns diskCacheDirector:(NSString *)directory;
 
+/**
+ *  设置内存缓存区大小
+ *
+ *  @param maxSize 内存缓存区大小，字节？
+ */
+- (void)setMaxMemoryCost:(NSUInteger)maxSize;
+
 #pragma mark -
 
 - (void)setImage:(UIImage *)image forKey:(NSString *)key;
@@ -113,9 +120,14 @@ typedef void(^LYSImageNoPramaBlock)();
 #pragma mark -
 
 /**
+ *  清除内存中所有的缓存
+ */
+- (void)clearAllCacheInMemory;
+
+/**
  *  清除所有的磁盘缓存数据
  */
-- (void)clearDiskCache;
+- (void)clearAllCacheInDisk;
 
 /**
  *  清除磁盘中所有过期缓存。
