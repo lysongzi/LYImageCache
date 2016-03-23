@@ -26,6 +26,9 @@ FOUNDATION_STATIC_INLINE NSUInteger LYCacheCostForImage(UIImage *image)
     return image.size.height * image.size.width * image.scale * image.scale;
 }
 
+/**
+ *  根据data数据的头部签名判断是否数据源为PNG图片
+ */
 BOOL imageDataHasPNGPreffix(NSData *data){
     
     if (!kPNGSignatureData) {
@@ -91,6 +94,16 @@ BOOL imageDataHasPNGPreffix(NSData *data){
 
 #pragma mark -
 
++ (instancetype)sharedImageCache
+{
+    static id instance;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        instance = [[self alloc] init];
+    });
+    return instance;
+}
+
 - (instancetype)init
 {
     return [self initWithNamespace:@"default"];
@@ -128,13 +141,15 @@ BOOL imageDataHasPNGPreffix(NSData *data){
         _shouldCacheInMemory = YES;
         _shouldCahceInDisk = YES;
         
+        _maxCacheAge = defaultMaxCacheAge;
+        
         dispatch_sync(_ioQueue, ^{
             _fileManager = [NSFileManager new];
         });
         
 #if TARGET_OS_IPHONE
         //当收到内存警告时清除内存中的缓存
-        [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(clearAllCacheInDisk) name:UIApplicationDidReceiveMemoryWarningNotification object:nil];
+        [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(clearAllCacheInMemory) name:UIApplicationDidReceiveMemoryWarningNotification object:nil];
         //当应用将关闭时，清除磁盘中过期的缓存
         [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(clearDiskExpiredCache) name:UIApplicationWillTerminateNotification object:nil];
         //当应用进入后台时候，清除磁盘中过期的缓存,需要请求后台运行
@@ -406,15 +421,15 @@ BOOL imageDataHasPNGPreffix(NSData *data){
 /**
  *  清除所有内存缓冲
  */
-- (void)clearMemory
+- (void)clearAllCacheInMemory
 {
     [self.memoryCache removeAllObjects];
 }
 
 /**
- *  清除所有磁盘缓存
+ *  清除所有磁盘缓存,原理就是把缓存目录删除，然后新建一个缓存目录
  */
-- (void)clearDiskCache
+- (void)clearAllCacheInDisk
 {
     dispatch_async(self.ioQueue, ^{
         //删除缓存目录,直接把所有缓存都删除了hahahahahhaha
@@ -431,7 +446,91 @@ BOOL imageDataHasPNGPreffix(NSData *data){
  */
 - (void)clearDiskExpiredCacheWithCompletionBlock:(LYSImageNoPramaBlock)completion
 {
-    //待完成...
+    //这是个比较耗时的磁盘操作，所以开启异步任务
+    dispatch_async(self.ioQueue, ^{
+        NSURL *diskCacheURL = [NSURL fileURLWithPath:self.diskCachePath isDirectory:YES];
+        //设置需要文件枚举器获取哪些文件的相关信息,比如文件是否是目录，文件最新修改日期，文件大小
+        NSArray *resourceKeys = @[NSURLIsDirectoryKey, NSURLContentModificationDateKey, NSURLTotalFileAllocatedSizeKey];
+        
+        //创建一个文件枚举器，预取和文件相关的信息，其中忽略隐藏文件
+        NSDirectoryEnumerator *fileEnumerator = [_fileManager enumeratorAtURL:diskCacheURL
+                                                   includingPropertiesForKeys:resourceKeys
+                                                                      options:NSDirectoryEnumerationSkipsHiddenFiles
+                                                                 errorHandler:nil];
+        
+        //计算距离当前时间的最晚过期时间
+        NSDate *expirationDate = [NSDate dateWithTimeIntervalSinceNow:-self.maxCacheAge];
+        NSMutableDictionary *cacheFile = [NSMutableDictionary new];
+        NSUInteger currentCacheSize = 0;
+        
+        NSMutableArray *urlsToDelete = [NSMutableArray new];
+        
+        /**
+         *  这个循环将主要做如下两件事：
+         *  1.找出所有的过期缓存文件。
+         *  2.保存所有非过期文件的相关信息，以便后续进一步的清除工作。
+         */
+        for (NSURL *fileUrl in fileEnumerator) {
+            @autoreleasepool {
+                NSDictionary *resourceValues = [fileUrl resourceValuesForKeys:resourceKeys error:nil];
+                
+                //如果为目录文件，则跳过
+                if (resourceValues[NSURLIsDirectoryKey]) {
+                    continue;
+                }
+                
+                //如果超过了最大缓存期，则将其添加到待删除的数组中
+                NSDate *modifiedDate = resourceValues[NSURLContentModificationDateKey];
+                if ([[modifiedDate laterDate:expirationDate] isEqualToDate:expirationDate]) {
+                    [urlsToDelete addObject:fileUrl];
+                    continue;
+                }
+                
+                //剩下这些就是既不是目录，也不是过期的缓存文件
+                //则统计它们的大小，并存储相关的文件信息，以便后续操作。
+                NSNumber *size = resourceValues[NSURLTotalFileAllocatedSizeKey];
+                currentCacheSize += [size unsignedIntegerValue];
+                [cacheFile setObject:resourceValues forKey:fileUrl];
+            }
+        }
+        
+        //删除过期缓存
+        for (NSURL *fileURL in urlsToDelete) {
+            [_fileManager removeItemAtURL:fileURL error:nil];
+        }
+        
+        //此时判断当前缓存文件大小是否超出设定的最大磁盘缓存大小，如果超出则进行进一步的缓存删除
+        //此时的清除策略如下：
+        //1.设定目标为将清除缓存到预设的最大缓存大小的一半
+        //2.从最早的缓存文件开始删除，直到达到(1)中设置的目标
+        //所以首先会进行按时间排序
+        if (self.maxCacheSize > 0 && currentCacheSize > self.maxCacheSize) {
+            const NSUInteger desiredCacheSize = self.maxCacheSize / 2;
+            
+            //将不过期的缓存按修改时间先后进行排序
+            NSArray *sortedFile = [cacheFile keysSortedByValueWithOptions:NSSortConcurrent usingComparator:^NSComparisonResult(id  _Nonnull obj1, id  _Nonnull obj2) {
+                return [obj1[NSURLContentModificationDateKey] compare:obj2[NSURLContentModificationDateKey]];
+            }];
+            
+            //从最早的缓存文件开始删除
+            for (NSURL *fileURL in sortedFile) {
+                if ([_fileManager removeItemAtURL:fileURL error:nil]) {
+                    NSDictionary *resourceValues = cacheFile[fileURL];
+                    currentCacheSize -= [resourceValues[NSURLTotalFileAllocatedSizeKey] unsignedIntegerValue];
+                    
+                    if (currentCacheSize <= desiredCacheSize) {
+                        break;
+                    }
+                }
+            }
+        }
+        
+        if (completion) {
+            dispatch_async(dispatch_get_main_queue(), ^{
+                completion();
+            });
+        }
+    });
 }
 
 - (void)clearDiskExpiredCache
@@ -497,6 +596,39 @@ BOOL imageDataHasPNGPreffix(NSData *data){
     }
 }
 
+#pragma mark - 
 
+/**
+ *  计算磁盘中缓存文件数
+ */
+- (NSUInteger)getDiskCacheCount
+{
+    __block NSUInteger count = 0;
+    dispatch_sync(self.ioQueue, ^{
+        //枚举缓存目录下的文件
+        NSDirectoryEnumerator *enumerator = [_fileManager enumeratorAtPath:self.diskCachePath];
+        count = [[enumerator allObjects] count];
+    });
+    return count;
+}
+
+/**
+ *  计算磁盘中缓存文件大小
+ */
+-(NSUInteger)getDiskCacheSize
+{
+    __block NSUInteger size = 0;
+    dispatch_sync(self.ioQueue, ^{
+        NSDirectoryEnumerator *enumerator = [_fileManager enumeratorAtPath:self.diskCachePath];
+        for (NSString *fileName in enumerator) {
+            @autoreleasepool {
+                NSString *filePath = [self.diskCachePath stringByAppendingPathComponent:fileName];
+                NSDictionary *attrs = [[NSFileManager defaultManager] attributesOfItemAtPath:filePath error:nil];
+                size += [attrs fileSize];
+            }
+        }
+    });
+    return size;
+}
 
 @end
